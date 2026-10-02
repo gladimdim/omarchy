@@ -57,6 +57,11 @@ RESCAN_INTERVAL = 2.0
 # The controller streams state reports several hundred times a second, so a
 # held button with no report for this long is no longer known to be held.
 STALE_AFTER = 0.5
+# Read those reports in batches rather than waking for each one: often while a
+# button is held, so scrolling stays smooth, and less often otherwise. hidraw
+# queues 64 reports, far more than either batch holds, so no press is missed.
+BATCH_INTERVAL = 0.02
+IDLE_BATCH_INTERVAL = 0.05
 HI_RES_PER_NOTCH = 120
 
 
@@ -82,6 +87,10 @@ class Paddles:
         return (total > 0) - (total < 0)
 
     def update(self, held, now):
+        if self.stale(now):
+            # Reports resume after a stall: a button still held is not a new
+            # press, but its repeat starts over rather than firing at once.
+            self.next_repeat = now + REPEAT_DELAY
         self.last_report = now
         pressed = held - self.held
         self.held = set(held)
@@ -90,17 +99,20 @@ class Paddles:
         self.next_repeat = now + REPEAT_DELAY
         return self.direction()
 
+    def stale(self, now):
+        return now - self.last_report >= STALE_AFTER
+
     def due(self, now):
-        if self.held and now - self.last_report >= STALE_AFTER:
-            self.held = set()  # Reports stopped; don't scroll on a stale hold.
+        # Reports stopped, so the hold can't be trusted: pause rather than
+        # forget it, so a report showing the same buttons isn't a new press.
         direction = self.direction()
-        if not direction or now < self.next_repeat:
+        if not direction or self.stale(now) or now < self.next_repeat:
             return 0
         self.next_repeat = now + REPEAT_INTERVAL
         return direction
 
     def timeout(self, now):
-        if not self.direction():
+        if not self.direction() or self.stale(now):
             return None
         return max(0.0, min(self.next_repeat, self.last_report + STALE_AFTER) - now)
 
@@ -113,42 +125,36 @@ def lizard_mode_on():
         return False
 
 
-def steam_running():
-    for comm in glob.glob(os.path.join(PROC_ROOT, "[0-9]*/comm")):
+def claimed_elsewhere(node):
+    """Whether Steam is running, or another process has the controller's raw
+    node open. Process names are checked first, since they are cheap and Steam
+    is the common case, then open files. Only processes this user may inspect
+    are seen; root mappers are caught by the lizard_mode check instead."""
+    own = str(os.getpid())
+    processes = [p for p in glob.glob(os.path.join(PROC_ROOT, "[0-9]*")) if os.path.basename(p) != own]
+    for process in processes:
         try:
-            with open(comm) as name:
+            with open(os.path.join(process, "comm")) as name:
                 if name.read().strip() == "steam":
                     return True
         except OSError:
             continue
-    return False
-
-
-def opened_elsewhere(node):
-    """Whether a process other than this one has the controller's raw node
-    open. Only processes this user may inspect are seen; root mappers are
-    caught by the lizard_mode check instead."""
-    own = str(os.getpid())
-    for fd_dir in glob.glob(os.path.join(PROC_ROOT, "[0-9]*/fd")):
-        if os.path.basename(os.path.dirname(fd_dir)) == own:
-            continue
+    for process in processes:
         try:
-            fds = os.listdir(fd_dir)
+            fds = os.listdir(os.path.join(process, "fd"))
         except OSError:
             continue
         for fd in fds:
             try:
-                if os.readlink(os.path.join(fd_dir, fd)) == node:
+                if os.readlink(os.path.join(process, "fd", fd)) == node:
                     return True
             except OSError:
                 continue
     return False
 
 
-def should_run(node=None):
-    if not lizard_mode_on() or steam_running():
-        return False
-    return node is None or not opened_elsewhere(node)
+def should_run(node):
+    return lizard_mode_on() and not claimed_elsewhere(node)
 
 
 def find_controller():
@@ -187,22 +193,32 @@ def drive(controller, node, scroll):
         ready, _, _ = select.select([controller], [], [], wait)
         now = time.monotonic()
         if ready:
-            report = os.read(controller, REPORT_SIZE)
-            if not report:
-                raise OSError("controller closed")
-            held = held_buttons(report)
-            if held is not None:
-                scroll(paddles.update(held, now))
+            while True:
+                try:
+                    report = os.read(controller, REPORT_SIZE)
+                except BlockingIOError:
+                    break
+                if not report:
+                    raise OSError("controller closed")
+                held = held_buttons(report)
+                if held is not None:
+                    scroll(paddles.update(held, now))
         scroll(paddles.due(now))
+        if ready:
+            # Let the next batch queue up instead of waking for every report.
+            time.sleep(BATCH_INTERVAL if paddles.held else IDLE_BATCH_INTERVAL)
 
 
 def main():
     lock_path = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "omarchy-steam-deck-paddles.lock")
-    lock = open(lock_path, "w")
     try:
+        lock = open(lock_path, "w")
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         return 0  # Already running; a second copy would scroll twice per press.
+    except OSError as error:
+        print(f"omarchy-hw-steam-deck-paddles: cannot lock {lock_path} ({error})", file=sys.stderr)
+        return 1
 
     try:
         import evdev
@@ -229,14 +245,26 @@ def main():
             wheel.write(EV_REL, REL_WHEEL_HI_RES, notches * HI_RES_PER_NOTCH)
             wheel.syn()
 
+    open_error = None
     with wheel:
         while True:
-            node = find_controller() if should_run() else None
-            if node is not None and should_run(node):
+            # lizard_mode off means a mapper owns the controller; skip the sysfs scan.
+            node = find_controller() if lizard_mode_on() else None
+            if node is None:
+                open_error = None  # Gone; report afresh when it comes back.
+            elif open_error is not None and not os.access(node, os.R_OK):
+                pass  # Still can't read it; already said why, skip the /proc scan.
+            elif should_run(node):
                 try:
-                    controller = os.open(node, os.O_RDONLY | os.O_CLOEXEC)
-                except OSError:
+                    controller = os.open(node, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+                    open_error = None
+                except OSError as error:
                     controller = None
+                    # Say why once, not every rescan.
+                    if str(error) != open_error:
+                        open_error = str(error)
+                        hint = "; steam-devices grants access to it" if isinstance(error, PermissionError) else ""
+                        print(f"omarchy-hw-steam-deck-paddles: cannot open {node} ({error}){hint}", file=sys.stderr)
                 if controller is not None:
                     try:
                         drive(controller, node, scroll)

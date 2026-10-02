@@ -70,12 +70,18 @@ check(p.due(40.0 + delay) == -1, "a hold refreshed by reports keeps repeating")
 check(p.timeout(40.0 + delay + interval) == 0.0, "a repeat is due")
 check(p.timeout(40.0 + delay + 0.01) <= stale, "the loop wakes by the stale limit")
 check(p.due(40.0 + delay + stale) == 0, "a hold with no reports for the stale limit stops scrolling")
-check(p.held == set(), "and is forgotten")
-check(p.update({L5}, 50.0) == -1, "a fresh report of the same button scrolls again")
+check(p.timeout(40.0 + delay + stale) is None, "and the loop stops waking for it")
+check(p.update({L5}, 50.0) == 0, "reports resuming with the same button held are not a new press")
+check(p.due(50.0) == 0, "and don't fire a backlog of repeats at once")
+check(p.due(50.0 + delay) == -1, "the hold repeats again after the repeat delay")
+check(p.update(set(), 50.1) == 0 and p.due(51.0) == 0, "releasing it after a stall stops the scroll")
+check(p.update({L5}, 52.0) == -1, "a fresh press after the release scrolls again")
 
+import signal
 import tempfile
 
-root = tempfile.mkdtemp()
+root_dir = tempfile.TemporaryDirectory()  # Removed when the interpreter exits, pass or fail.
+root = root_dir.name
 paddles.HIDRAW_CLASS = os.path.join(root, "hidraw")
 paddles.DEV_ROOT = os.path.join(root, "dev")
 paddles.PROC_ROOT = os.path.join(root, "proc")
@@ -101,11 +107,11 @@ hidraw("hidraw2", "000028DE:00001205", bytes([0x06, 0xFF, 0xFF, 0x09, 0x01]))
 check(paddles.find_controller() == os.path.join(paddles.DEV_ROOT, "hidraw2"), "the Deck interface on a vendor page is the controller")
 
 node = os.path.join(paddles.DEV_ROOT, "hidraw2")
-check(not paddles.lizard_mode_on() and not paddles.should_run(), "a missing hid_steam parameter stands aside")
+check(not paddles.lizard_mode_on() and not paddles.should_run(node), "a missing hid_steam parameter stands aside")
 write(paddles.LIZARD_MODE, "N\n")
-check(not paddles.should_run(), "lizard mode off means a mapper owns the controller")
+check(not paddles.should_run(node), "lizard mode off means a mapper owns the controller")
 write(paddles.LIZARD_MODE, "Y\n")
-check(paddles.should_run() and paddles.should_run(node), "lizard mode on with nothing else running scrolls")
+check(paddles.should_run(node), "lizard mode on with nothing else running scrolls")
 
 write(os.path.join(paddles.PROC_ROOT, "100/comm"), "hyprland\n")
 os.makedirs(os.path.join(paddles.PROC_ROOT, "100/fd"))
@@ -120,11 +126,59 @@ write(os.path.join(paddles.PROC_ROOT, "200/comm"), "SDLGame\n")
 os.makedirs(os.path.join(paddles.PROC_ROOT, "200/fd"))
 os.symlink(node, os.path.join(paddles.PROC_ROOT, "200/fd/7"))
 check(not paddles.should_run(node), "another program reading the controller stands it aside")
-check(paddles.should_run(), "the open check needs the node")
+check(paddles.should_run(os.path.join(paddles.DEV_ROOT, "hidraw9")), "a reader of another node doesn't count")
 os.unlink(os.path.join(paddles.PROC_ROOT, "200/fd/7"))
 
 write(os.path.join(paddles.PROC_ROOT, "300/comm"), "steam\n")
-check(not paddles.should_run(), "Steam running stands it aside")
+check(not paddles.should_run(node), "Steam running stands it aside, even before it opens the controller")
+
+# drive() reads the reports queued since its last wake in one batch, so a
+# press released within the batch still scrolls. A pipe stands in for hidraw.
+# should_run lets the first check through and stands aside at the second, so
+# a slow runner can't end the drive before the reports are read.
+checks = []
+
+
+def stand_aside_second_time(node):
+    checks.append(node)
+    return len(checks) < 2
+
+
+ready_wakes = []
+real_select, real_should_run, real_rescan = paddles.select.select, paddles.should_run, paddles.RESCAN_INTERVAL
+
+
+def counting_select(*args):
+    ready = real_select(*args)
+    if ready[0]:
+        ready_wakes.append(1)
+    return ready
+
+
+reader, writer = os.pipe()
+os.set_blocking(reader, False)
+os.write(writer, report((13, 1)) + report() + report((10, 0)) + report())
+notches = []
+paddles.select.select, paddles.should_run, paddles.RESCAN_INTERVAL = counting_select, stand_aside_second_time, 0.05
+try:
+    paddles.drive(reader, node, lambda n: n and notches.append(n))
+    batch_wakes = len(ready_wakes)
+    os.close(writer)
+    paddles.should_run = lambda node: True  # only EOF may end this one
+    closed = False
+    signal.alarm(5)  # a regression that ignores EOF fails here instead of hanging the suite
+    try:
+        paddles.drive(reader, node, lambda n: None)
+    except OSError:
+        closed = True
+    finally:
+        signal.alarm(0)
+finally:
+    paddles.select.select, paddles.should_run, paddles.RESCAN_INTERVAL = real_select, real_should_run, real_rescan
+    os.close(reader)
+check(notches == [1, -1], f"every press in a batch scrolls once, got {notches}")
+check(batch_wakes == 1, f"queued reports are read in one wake, not one each ({batch_wakes} wakes)")
+check(closed, "a closed controller ends the drive")
 print("ok")
 PY
 ) || fail "paddle scroll logic" "$output"
