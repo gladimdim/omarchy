@@ -1,0 +1,219 @@
+#!/usr/bin/python3
+
+# omarchy:summary=Scroll with the Steam Deck back buttons (upper pair up, lower pair down)
+# omarchy:hidden=true
+
+# On the desktop the Deck's controller runs in lizard mode: its firmware drives
+# the pointer from the trackpad, and the kernel's hid-steam driver withholds
+# every gamepad button until the user holds the menu button to switch to
+# gamepad mode, which turns the pointer off. The back buttons do nothing either
+# way. This reads them from the controller's raw reports, the same channel Steam
+# uses, and scrolls through a virtual mouse wheel: L4 and R4 (upper) scroll up,
+# L5 and R5 (lower) scroll down, so either hand can scroll both ways. A press
+# scrolls one notch and a hold keeps scrolling.
+#
+# While the channel is open the kernel removes its own gamepad device, as it
+# does for Steam. Lizard mode carries on, so the pointer keeps working, and
+# Steam and SDL games read the same raw channel. So this stands aside whenever
+# Steam is running, and whenever lizard mode is switched off, which means
+# another program is driving the controller.
+
+import fcntl
+import glob
+import os
+import select
+import sys
+import time
+
+# From linux/input-event-codes.h, kept as numbers so the scroll logic can be
+# tested without python-evdev installed.
+EV_REL = 0x02
+REL_WHEEL = 0x08
+REL_WHEEL_HI_RES = 0x0B
+BTN_GRIPL = 0x224   # L4
+BTN_GRIPR = 0x225   # R4
+BTN_GRIPL2 = 0x226  # L5
+BTN_GRIPR2 = 0x227  # R5
+
+DIRECTIONS = {BTN_GRIPL: 1, BTN_GRIPR: 1, BTN_GRIPL2: -1, BTN_GRIPR2: -1}
+
+# A Deck state report is 64 bytes starting 0x01 0x00 0x09; the back buttons sit
+# at these (byte, bit) positions. Both from drivers/hid/hid-steam.c.
+REPORT_SIZE = 64
+DECK_STATE = 0x09
+BUTTON_BITS = {BTN_GRIPL: (13, 1), BTN_GRIPR: (13, 2), BTN_GRIPL2: (9, 7), BTN_GRIPR2: (10, 0)}
+
+DECK_HID_ID = "000028DE:00001205"
+LIZARD_MODE = "/sys/module/hid_steam/parameters/lizard_mode"
+
+REPEAT_DELAY = 0.30
+REPEAT_INTERVAL = 0.06
+RESCAN_INTERVAL = 2.0
+HI_RES_PER_NOTCH = 120
+
+
+def held_buttons(report):
+    """The back buttons held in a Deck state report, or None for any other
+    report."""
+    if len(report) != REPORT_SIZE or report[0] != 0x01 or report[1] != 0x00 or report[2] != DECK_STATE:
+        return None
+    return {code for code, (byte, bit) in BUTTON_BITS.items() if report[byte] >> bit & 1}
+
+
+class Paddles:
+    """Turns back-button state into wheel notches: one when a button goes
+    down, then a repeat while held. Opposite buttons held together cancel."""
+
+    def __init__(self):
+        self.held = set()
+        self.next_repeat = 0.0
+
+    def direction(self):
+        total = sum(DIRECTIONS[code] for code in self.held)
+        return (total > 0) - (total < 0)
+
+    def update(self, held, now):
+        pressed = held - self.held
+        self.held = set(held)
+        if not pressed:
+            return 0
+        self.next_repeat = now + REPEAT_DELAY
+        return self.direction()
+
+    def due(self, now):
+        direction = self.direction()
+        if not direction or now < self.next_repeat:
+            return 0
+        self.next_repeat = now + REPEAT_INTERVAL
+        return direction
+
+    def timeout(self, now):
+        if not self.direction():
+            return None
+        return max(0.0, self.next_repeat - now)
+
+
+def lizard_mode_on():
+    try:
+        with open(LIZARD_MODE) as param:
+            return param.read().strip() == "Y"
+    except OSError:
+        return False
+
+
+def steam_running():
+    for comm in glob.glob("/proc/[0-9]*/comm"):
+        try:
+            with open(comm) as name:
+                if name.read().strip() == "steam":
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def should_run():
+    return lizard_mode_on() and not steam_running()
+
+
+def find_controller():
+    """The raw node of the Deck's controller interface. The trackpad mouse and
+    keyboard interfaces share its USB ID; only the controller's report
+    descriptor opens on a vendor-defined usage page (0x06 xx 0xFF)."""
+    for node in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
+        try:
+            with open(os.path.join(node, "device/uevent")) as uevent:
+                if DECK_HID_ID not in uevent.read():
+                    continue
+            with open(os.path.join(node, "device/report_descriptor"), "rb") as descriptor:
+                head = descriptor.read(3)
+        except OSError:
+            continue
+        if len(head) == 3 and head[0] == 0x06 and head[2] == 0xFF:
+            return os.path.join("/dev", os.path.basename(node))
+    return None
+
+
+def drive(controller, scroll):
+    """Scroll from the controller's reports until this should stand aside.
+    Raises OSError when the controller goes away."""
+    paddles = Paddles()
+    next_check = time.monotonic() + RESCAN_INTERVAL
+
+    while True:
+        now = time.monotonic()
+        if now >= next_check:
+            if not should_run():
+                return
+            next_check = now + RESCAN_INTERVAL
+
+        repeat = paddles.timeout(now)
+        wait = next_check - now if repeat is None else min(repeat, next_check - now)
+        ready, _, _ = select.select([controller], [], [], wait)
+        now = time.monotonic()
+        if ready:
+            report = os.read(controller, REPORT_SIZE)
+            if not report:
+                raise OSError("controller closed")
+            held = held_buttons(report)
+            if held is not None:
+                scroll(paddles.update(held, now))
+        scroll(paddles.due(now))
+
+
+def main():
+    lock_path = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "omarchy-steam-deck-paddles.lock")
+    lock = open(lock_path, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return 0  # Already running; a second copy would scroll twice per press.
+
+    try:
+        import evdev
+        from evdev import ecodes
+    except ImportError:
+        print("omarchy-hw-steam-deck-paddles: python-evdev is missing (omarchy pkg add python-evdev)", file=sys.stderr)
+        return 1
+
+    # Advertised as a mouse, because libinput ignores a device that only has a
+    # wheel. It never moves or clicks.
+    capabilities = {
+        ecodes.EV_KEY: [ecodes.BTN_LEFT, ecodes.BTN_RIGHT, ecodes.BTN_MIDDLE],
+        ecodes.EV_REL: [ecodes.REL_X, ecodes.REL_Y, ecodes.REL_WHEEL, ecodes.REL_WHEEL_HI_RES],
+    }
+    try:
+        wheel = evdev.UInput(capabilities, name="Steam Deck back buttons")
+    except OSError as error:
+        print(f"omarchy-hw-steam-deck-paddles: cannot open /dev/uinput ({error}); steam-devices grants access to it", file=sys.stderr)
+        return 1
+
+    def scroll(notches):
+        if notches:
+            wheel.write(EV_REL, REL_WHEEL, notches)
+            wheel.write(EV_REL, REL_WHEEL_HI_RES, notches * HI_RES_PER_NOTCH)
+            wheel.syn()
+
+    with wheel:
+        while True:
+            node = find_controller() if should_run() else None
+            if node is not None:
+                try:
+                    controller = os.open(node, os.O_RDONLY | os.O_CLOEXEC)
+                except OSError:
+                    controller = None
+                if controller is not None:
+                    try:
+                        drive(controller, scroll)
+                    except OSError:
+                        pass  # Unplugged, or gone over suspend; look again.
+                    finally:
+                        os.close(controller)
+            time.sleep(RESCAN_INTERVAL)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(0)
