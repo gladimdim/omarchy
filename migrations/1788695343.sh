@@ -32,8 +32,18 @@ as_root() {
 if [[ -f $keyboard_backlight && ! -L $keyboard_backlight ]]; then
   digest=$(sha256sum -- "$keyboard_backlight" 2>/dev/null || true)
   if [[ -n $digest && " ${legacy_keyboard_sha256s[*]} " == *" ${digest%% *} "* ]]; then
-    # Copying onto the existing file keeps its root ownership.
-    as_root cp -- "$OMARCHY_PATH/default/systemd/system-sleep/keyboard-backlight" "$keyboard_backlight"
+    # Stage the new hook beside the old one and rename it into place, so a
+    # failed copy leaves the shipped version that a retry still recognizes.
+    # systemd-sleep skips hidden files, so the stage never runs.
+    stage=$(as_root mktemp -- "$hook_dir/.keyboard-backlight.omarchy.XXXXXX")
+    if as_root install -m 0755 -T -- "$OMARCHY_PATH/default/systemd/system-sleep/keyboard-backlight" "$stage" &&
+      as_root mv -Tf -- "$stage" "$keyboard_backlight"; then
+      :
+    else
+      as_root rm -f -- "$stage"
+      echo "Could not replace $keyboard_backlight; rerun omarchy-migrate to retry" >&2
+      exit 1
+    fi
   fi
 fi
 

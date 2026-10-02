@@ -123,7 +123,22 @@ SH
 [[ $(sha256sum "$tmp_dir/system-sleep/keyboard-backlight" | cut -d' ' -f1) == 79215eed4da8036e25cd70ad09276823aad92d386a68c69d589d587c93b79c60 ]] ||
   fail "keyboard-backlight legacy fixture no longer matches the migration fingerprint"
 chmod 644 "$tmp_dir/system-sleep/keyboard-backlight"
+legacy_keyboard_backlight=$(<"$tmp_dir/system-sleep/keyboard-backlight")
+install -m644 "$hooks_dir/force-igpu" "$tmp_dir/system-sleep/force-igpu"
 install -m644 /dev/null "$tmp_dir/system-sleep/unrelated"
+
+# A replacement that fails leaves the shipped hook in place, so a retry still
+# recognizes and replaces it instead of treating a partial copy as custom.
+if PATH="$stub_bin:$PATH" SUDO_CALLS="$sudo_calls" OMARCHY_PATH="$tmp_dir/missing" OMARCHY_SYSTEM_SLEEP_DIR="$tmp_dir/system-sleep" \
+  bash -euo pipefail "$ROOT/migrations/1788695343.sh" >/dev/null 2>&1; then
+  fail "migration reports a failed hook replacement"
+fi
+[[ $(<"$tmp_dir/system-sleep/keyboard-backlight") == "$legacy_keyboard_backlight" ]] ||
+  fail "a failed replacement leaves the shipped hook untouched"
+[[ -z $(find "$tmp_dir/system-sleep" -name '.keyboard-backlight.omarchy.*') ]] ||
+  fail "a failed replacement leaves no staged copy behind"
+pass "a failed hook replacement leaves the shipped hook for the retry"
+rm -f "$sudo_calls"
 
 run_migration ||
   fail "migration completes on a 644 hook"
@@ -131,11 +146,17 @@ run_migration ||
 cmp -s "$hooks_dir/keyboard-backlight" "$tmp_dir/system-sleep/keyboard-backlight" ||
   fail "migration replaces a shipped keyboard-backlight hook with the current one"
 [[ ! -x $tmp_dir/system-sleep/unrelated ]] || fail "migration leaves other files alone"
-grep -Fqx -- "cp -- $ROOT/default/systemd/system-sleep/keyboard-backlight $tmp_dir/system-sleep/keyboard-backlight" "$sudo_calls" ||
-  fail "migration replaces the root-owned hook through sudo"
-grep -Fqx -- "chmod 755 $tmp_dir/system-sleep/keyboard-backlight" "$sudo_calls" ||
-  fail "migration makes the root-owned hook executable through sudo"
-pass "migration replaces a shipped 644 keyboard-backlight hook with the current, executable one"
+grep -Eq -- "^mv -Tf -- $tmp_dir/system-sleep/\.keyboard-backlight\.omarchy\.[[:alnum:]]{6} $tmp_dir/system-sleep/keyboard-backlight$" "$sudo_calls" ||
+  fail "migration renames the replacement into place through sudo"
+[[ -z $(find "$tmp_dir/system-sleep" -name '.keyboard-backlight.omarchy.*') ]] ||
+  fail "migration leaves no staged copy behind"
+[[ -x $tmp_dir/system-sleep/force-igpu ]] || fail "migration makes force-igpu executable"
+grep -Fqx -- "chmod 755 $tmp_dir/system-sleep/force-igpu" "$sudo_calls" ||
+  fail "migration makes the root-owned force-igpu executable through sudo"
+cmp -s "$hooks_dir/force-igpu" "$tmp_dir/system-sleep/force-igpu" || fail "migration leaves force-igpu's content alone"
+grep -Eq -- "^install -m 0755 -T -- $ROOT/default/systemd/system-sleep/keyboard-backlight $tmp_dir/system-sleep/\.keyboard-backlight\.omarchy\.[[:alnum:]]{6}$" "$sudo_calls" ||
+  fail "migration stages the root-owned replacement executable through sudo"
+pass "migration replaces a shipped 644 keyboard-backlight hook and makes a 644 force-igpu executable"
 
 rm -f "$sudo_calls"
 run_migration || fail "migration is idempotent"
