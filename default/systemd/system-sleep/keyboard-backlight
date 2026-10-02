@@ -6,13 +6,13 @@
 # alone: zeroing them with no restore left their backlight off for good, since
 # systemd-backlight then saves the 0 at the next shutdown.
 
-leds_dir=${OMARCHY_LEDS_DIR:-/sys/class/leds}
+leds_dir=/sys/class/leds
 # /run is in RAM, so it is part of the hibernation image and survives resume.
-state_dir=${OMARCHY_KBD_BACKLIGHT_STATE_DIR:-/run/omarchy-kbd-backlight}
+state_dir=/run/omarchy-kbd-backlight
 sleep_action=${SYSTEMD_SLEEP_ACTION:-$2}
 
 if [[ $1 == "pre" && $sleep_action == "hibernate" ]]; then
-  for led in "$leds_dir"/asus*::kbd_backlight*; do
+  for led in "$leds_dir"/asus*kbd_backlight*; do
     [[ -f $led/brightness ]] || continue
     saved="$state_dir/${led##*/}"
     if ! { mkdir -p "$state_dir" && cat "$led/brightness" >"$saved" && [[ -s $saved ]]; }; then

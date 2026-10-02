@@ -683,17 +683,21 @@ grep -Fq '"mode": "Integrated"' "$hook_config" ||
 [[ ! -e $hook_marker ]] || fail "force-igpu leaves stale restore intent after compound hibernation"
 pass "force-igpu handles both phases of suspend-then-hibernate"
 
+keyboard_hook_copy="$test_tmp/keyboard-backlight-hook"
 keyboard_led_dir="$test_tmp/leds"
-keyboard_state_dir="$test_tmp/keyboard-backlight-state"
 mkdir -p "$keyboard_led_dir/asus::kbd_backlight"
 echo 3 >"$keyboard_led_dir/asus::kbd_backlight/brightness"
+sed -e "s|^leds_dir=/sys/class/leds$|leds_dir=$keyboard_led_dir|" \
+  -e "s|^state_dir=/run/omarchy-kbd-backlight$|state_dir=$test_tmp/keyboard-backlight-state|" \
+  "$ROOT/default/systemd/system-sleep/keyboard-backlight" >"$keyboard_hook_copy"
+grep -q "^leds_dir=$keyboard_led_dir$" "$keyboard_hook_copy" &&
+  grep -q "^state_dir=$test_tmp/keyboard-backlight-state$" "$keyboard_hook_copy" ||
+  fail "keyboard-backlight test copy points at the fake LED and state directories"
 
-SYSTEMD_SLEEP_ACTION=suspend OMARCHY_LEDS_DIR="$keyboard_led_dir" OMARCHY_KBD_BACKLIGHT_STATE_DIR="$keyboard_state_dir" \
-  bash "$ROOT/default/systemd/system-sleep/keyboard-backlight" pre suspend-then-hibernate
+SYSTEMD_SLEEP_ACTION=suspend bash "$keyboard_hook_copy" pre suspend-then-hibernate
 [[ $(<"$keyboard_led_dir/asus::kbd_backlight/brightness") == 3 ]] ||
   fail "keyboard-backlight runs during the suspend phase of compound sleep"
-SYSTEMD_SLEEP_ACTION=hibernate OMARCHY_LEDS_DIR="$keyboard_led_dir" OMARCHY_KBD_BACKLIGHT_STATE_DIR="$keyboard_state_dir" \
-  bash "$ROOT/default/systemd/system-sleep/keyboard-backlight" pre suspend-then-hibernate
+SYSTEMD_SLEEP_ACTION=hibernate bash "$keyboard_hook_copy" pre suspend-then-hibernate
 [[ $(<"$keyboard_led_dir/asus::kbd_backlight/brightness") == 0 ]] ||
   fail "keyboard-backlight skips the hibernate phase of compound sleep"
 pass "keyboard-backlight handles the hibernate phase of suspend-then-hibernate"
