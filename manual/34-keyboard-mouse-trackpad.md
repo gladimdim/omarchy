@@ -57,7 +57,7 @@ hl.gesture({ fingers = 3, direction = "horizontal", action = "workspace" })
 
 On Dell XPS laptops with a haptic touchpad, you can also set the click strength to low, mid, or high under _Trigger > Hardware > Touchpad Haptics_.
 
-On the Steam Deck, the back buttons scroll like a mouse wheel: the upper pair (L4 and R4) scrolls up and the lower pair (L5 and R5) scrolls down. Hold one to keep scrolling. This pauses while Steam is running, so Steam's own controller layout applies. While it is active, games that read the controller through SDL keep working, but programs that read the kernel's gamepad device directly do not see the controller.
+On the Steam Deck, the back buttons scroll like a mouse wheel: the upper pair (L4 and R4) scrolls up and the lower pair (L5 and R5) scrolls down. Hold one to keep scrolling. This pauses while Steam is running, so Steam's own controller layout applies, and while a game is reading the controller itself. While it is active, programs that read the kernel's gamepad device directly do not see the controller, and holding ☰ does not switch to gamepad mode.
 
 ### Typing in Chinese, Japanese, and other languages
 
