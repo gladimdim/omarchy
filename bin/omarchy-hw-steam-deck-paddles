@@ -12,11 +12,13 @@
 # L5 and R5 (lower) scroll down, so either hand can scroll both ways. A press
 # scrolls one notch and a hold keeps scrolling.
 #
-# While the channel is open the kernel removes its own gamepad device, as it
-# does for Steam. Lizard mode carries on, so the pointer keeps working, and
-# Steam and SDL games read the same raw channel. So this stands aside whenever
-# Steam is running, and whenever lizard mode is switched off, which means
-# another program is driving the controller.
+# While the channel is open the kernel removes its own gamepad device and
+# ignores the menu-button hold that switches to gamepad mode, as it does for
+# Steam. Lizard mode carries on, so the pointer keeps working. Steam and SDL
+# games read the same raw channel, so this stands aside whenever any other
+# program has it open (they would see every press as well as the scroll),
+# whenever Steam is running, and whenever the hid_steam lizard_mode parameter
+# is off, which is how mappers such as InputPlumber and HHD take over.
 
 import fcntl
 import glob
@@ -45,10 +47,16 @@ BUTTON_BITS = {BTN_GRIPL: (13, 1), BTN_GRIPR: (13, 2), BTN_GRIPL2: (9, 7), BTN_G
 
 DECK_HID_ID = "000028DE:00001205"
 LIZARD_MODE = "/sys/module/hid_steam/parameters/lizard_mode"
+HIDRAW_CLASS = "/sys/class/hidraw"
+DEV_ROOT = "/dev"
+PROC_ROOT = "/proc"
 
 REPEAT_DELAY = 0.30
 REPEAT_INTERVAL = 0.06
 RESCAN_INTERVAL = 2.0
+# The controller streams state reports several hundred times a second, so a
+# held button with no report for this long is no longer known to be held.
+STALE_AFTER = 0.5
 HI_RES_PER_NOTCH = 120
 
 
@@ -67,12 +75,14 @@ class Paddles:
     def __init__(self):
         self.held = set()
         self.next_repeat = 0.0
+        self.last_report = 0.0
 
     def direction(self):
         total = sum(DIRECTIONS[code] for code in self.held)
         return (total > 0) - (total < 0)
 
     def update(self, held, now):
+        self.last_report = now
         pressed = held - self.held
         self.held = set(held)
         if not pressed:
@@ -81,6 +91,8 @@ class Paddles:
         return self.direction()
 
     def due(self, now):
+        if self.held and now - self.last_report >= STALE_AFTER:
+            self.held = set()  # Reports stopped; don't scroll on a stale hold.
         direction = self.direction()
         if not direction or now < self.next_repeat:
             return 0
@@ -90,7 +102,7 @@ class Paddles:
     def timeout(self, now):
         if not self.direction():
             return None
-        return max(0.0, self.next_repeat - now)
+        return max(0.0, min(self.next_repeat, self.last_report + STALE_AFTER) - now)
 
 
 def lizard_mode_on():
@@ -102,7 +114,7 @@ def lizard_mode_on():
 
 
 def steam_running():
-    for comm in glob.glob("/proc/[0-9]*/comm"):
+    for comm in glob.glob(os.path.join(PROC_ROOT, "[0-9]*/comm")):
         try:
             with open(comm) as name:
                 if name.read().strip() == "steam":
@@ -112,15 +124,38 @@ def steam_running():
     return False
 
 
-def should_run():
-    return lizard_mode_on() and not steam_running()
+def opened_elsewhere(node):
+    """Whether a process other than this one has the controller's raw node
+    open. Only processes this user may inspect are seen; root mappers are
+    caught by the lizard_mode check instead."""
+    own = str(os.getpid())
+    for fd_dir in glob.glob(os.path.join(PROC_ROOT, "[0-9]*/fd")):
+        if os.path.basename(os.path.dirname(fd_dir)) == own:
+            continue
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                if os.readlink(os.path.join(fd_dir, fd)) == node:
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+def should_run(node=None):
+    if not lizard_mode_on() or steam_running():
+        return False
+    return node is None or not opened_elsewhere(node)
 
 
 def find_controller():
     """The raw node of the Deck's controller interface. The trackpad mouse and
     keyboard interfaces share its USB ID; only the controller's report
     descriptor opens on a vendor-defined usage page (0x06 xx 0xFF)."""
-    for node in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
+    for node in sorted(glob.glob(os.path.join(HIDRAW_CLASS, "hidraw*"))):
         try:
             with open(os.path.join(node, "device/uevent")) as uevent:
                 if DECK_HID_ID not in uevent.read():
@@ -130,11 +165,11 @@ def find_controller():
         except OSError:
             continue
         if len(head) == 3 and head[0] == 0x06 and head[2] == 0xFF:
-            return os.path.join("/dev", os.path.basename(node))
+            return os.path.join(DEV_ROOT, os.path.basename(node))
     return None
 
 
-def drive(controller, scroll):
+def drive(controller, node, scroll):
     """Scroll from the controller's reports until this should stand aside.
     Raises OSError when the controller goes away."""
     paddles = Paddles()
@@ -143,7 +178,7 @@ def drive(controller, scroll):
     while True:
         now = time.monotonic()
         if now >= next_check:
-            if not should_run():
+            if not should_run(node):
                 return
             next_check = now + RESCAN_INTERVAL
 
@@ -197,14 +232,14 @@ def main():
     with wheel:
         while True:
             node = find_controller() if should_run() else None
-            if node is not None:
+            if node is not None and should_run(node):
                 try:
                     controller = os.open(node, os.O_RDONLY | os.O_CLOEXEC)
                 except OSError:
                     controller = None
                 if controller is not None:
                     try:
-                        drive(controller, scroll)
+                        drive(controller, node, scroll)
                     except OSError:
                         pass  # Unplugged, or gone over suspend; look again.
                     finally:
