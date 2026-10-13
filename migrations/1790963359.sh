@@ -52,6 +52,27 @@ value=$(autosuspend_value "$effective")
 if [[ $value == "-1" ]]; then
   echo "The booted kernel is missing $param; rebuilding the boot image"
   sudo limine-mkinitcpio
+
+  # limine-mkinitcpio carries on past a kernel it could not build, a full boot
+  # partition for one, and still exits 0. Done means a boot entry has the
+  # parameter: without that the migration stays pending and the next update
+  # tries again. A menu with no command lines in it (they are inside the boot
+  # images then) has nothing to look at, and is taken at its word.
+  limine_conf="${OMARCHY_LIMINE_CONF:-}"
+  if [[ -z $limine_conf ]]; then
+    esp=""
+    if [[ -r /etc/default/limine ]]; then
+      esp=$(sed -n 's/^ESP_PATH=["'\'']\?\([^"'\'']*\).*/\1/p' /etc/default/limine | tail -n 1)
+    fi
+    limine_conf="${esp:-/boot}/limine.conf"
+  fi
+
+  if sudo grep -Eq '^[[:space:]]*cmdline:' "$limine_conf" 2>/dev/null &&
+    ! sudo grep -Eq "^[[:space:]]*cmdline:.*[[:space:]]${param//./\\.}([[:space:]]|$)" "$limine_conf"; then
+    echo "The boot menu still has no entry with $param after the rebuild" >&2
+    exit 1
+  fi
+
   omarchy-state set reboot-required
   sudo install -Dm644 /dev/null "$rebuild_marker"
 elif [[ -n $value ]]; then

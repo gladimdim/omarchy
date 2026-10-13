@@ -25,6 +25,7 @@ defaults_conf="$dropins/omarchy-defaults.conf"
 default_limine="$test_dir/default-limine"
 running_cmdline="$test_dir/cmdline"
 marker="$test_dir/state/1790963359"
+limine_conf="$test_dir/limine.conf"
 output="$test_dir/output"
 mkdir -p "$stub_bin" "$dropins" "$test_dir/state"
 
@@ -73,7 +74,7 @@ run_migration() {
   rm -f "$calls"
   PATH="$stub_bin:$PATH" CALLS="$calls" OMARCHY_LIMINE_DEFAULTS_CONF="$defaults_conf" \
     OMARCHY_DEFAULT_LIMINE="$default_limine" OMARCHY_RUNNING_CMDLINE="$running_cmdline" \
-    OMARCHY_LIMINE_REBUILD_MARKER="$marker" bash -euo pipefail "$migration" >"$output" 2>&1
+    OMARCHY_LIMINE_REBUILD_MARKER="$marker" OMARCHY_LIMINE_CONF="$limine_conf" bash -euo pipefail "$migration" >"$output" 2>&1
 }
 rebuilt() {
   [[ -e $calls ]] && grep -Fxq "sudo limine-mkinitcpio" "$calls"
@@ -92,6 +93,20 @@ STUB_REBUILD_STATUS=1 run_migration && fail "migration reports a failed rebuild"
 [[ ! -e $marker ]] || fail "a failed rebuild leaves no marker, so the next run retries"
 ! reboot_flagged || fail "a failed rebuild doesn't ask for a reboot"
 pass "a failed rebuild is retried"
+
+# limine-mkinitcpio exits 0 even when a full boot partition kept it from
+# writing the new entry: a boot menu whose command lines still lack the
+# parameter leaves no marker, so the next update retries.
+printf '/Omarchy\n    cmdline: root=UUID=x rw quiet splash\n' >"$limine_conf"
+run_migration && fail "migration reports a rebuild that left the boot menu without the parameter"
+[[ ! -e $marker ]] || fail "a rebuild the boot menu doesn't show leaves no marker"
+! reboot_flagged || fail "a rebuild the boot menu doesn't show doesn't ask for a reboot"
+grep -q "still has no entry with usbcore.autosuspend=-1" "$output" || fail "migration says the boot menu lacks the parameter" "$(<"$output")"
+printf '/Omarchy\n    cmdline: root=UUID=x rw quiet splash usbcore.autosuspend=-1\n' >"$limine_conf"
+run_migration || fail "migration completes once the boot menu has the parameter" "$(<"$output")"
+[[ -e $marker ]] && reboot_flagged || fail "migration records a rebuild the boot menu shows"
+rm -f "$marker" "$limine_conf"
+pass "a rebuild that exits 0 without the parameter in the boot menu is retried"
 
 run_migration || fail "migration completes when the booted kernel lacks the parameter" "$(<"$output")"
 rebuilt || fail "migration rebuilds the boot image" "$(<"$calls")"
