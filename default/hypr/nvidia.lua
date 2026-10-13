@@ -9,7 +9,7 @@ local nvidia_without_gsp = paths.omarchy_path .. "/bin/omarchy-hw-nvidia-without
 -- lspci reads PCI config space, which resumes a runtime-suspended GPU, and on a
 -- hybrid laptop that wake alone outlasts Hyprland's 1.5s config reload budget.
 if o.shell_succeeds(o.shell_quote(nvidia)) then
-  -- GTK 4.14+ defaults to the Vulkan renderer, which leaves GTK4 apps
+  -- GTK 4.16+ defaults to the Vulkan renderer, which leaves GTK4 apps
   -- (Nautilus, Loupe) as blank windows or crashing on NVIDIA machines, most
   -- reliably when GTK's Vulkan device isn't the GPU Hyprland composites on.
   -- The OpenGL renderer avoids that. To choose another renderer, set
