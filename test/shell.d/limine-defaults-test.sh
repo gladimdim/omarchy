@@ -23,3 +23,11 @@ pass "packaged Limine defaults protect T2 Macs and prefer the exact Omarchy kern
 grep -Fq 'KERNEL_CMDLINE[default]+=" usbcore.autosuspend=-1"' "$packaged_defaults" ||
   fail "the packaged Limine defaults turn off USB autosuspend"
 pass "packaged Limine defaults turn off USB autosuspend"
+
+limine_template="$ROOT/default/limine/limine.conf"
+grep -Fxq 'timeout: 1' "$limine_template" ||
+  fail "the Limine template still waits out a long boot menu timeout"
+pass "Limine template waits 1 second for a key at boot"
+grep -Fxq 'quiet: yes' "$limine_template" ||
+  fail "the Limine template still draws the boot menu on every boot"
+pass "Limine template keeps the boot menu quiet until a key is pressed"
