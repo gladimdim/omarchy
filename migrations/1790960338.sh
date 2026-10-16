@@ -5,9 +5,11 @@ echo "Replace the keyboard-backlight and force-igpu sleep hooks earlier releases
 # executable and systemd-sleep silently skipped them: the keyboard LEDs stayed on
 # into S4 (which the hook exists to prevent on ASUS keyboards) and force-igpu
 # never detached the dGPU before hibernate. Both scripts now install them 0755.
-# Migration 1788662350 replaces copies a user could write, but leaves
-# root-owned ones alone, and cp -p from the root-owned packaged source produced
-# exactly that: a root-owned 644 hook.
+# Migration 1788662350 replaces the d604e7c4 force-igpu and f313a81e
+# keyboard-backlight copies whatever their owner, and fixes the mode of a copy
+# that matches the current source. It leaves a root-owned 644 de620729
+# force-igpu inert, which is what cp -p from the 0644 source produced between
+# January and February.
 #
 # Making those copies executable as they are would switch on old code: every
 # earlier keyboard-backlight zeroed any vendor's keyboard LED and never
@@ -19,7 +21,7 @@ hook_dir=/usr/lib/systemd/system-sleep
 source_dir="$OMARCHY_PATH/default/systemd/system-sleep"
 
 declare -A shipped_sha256s=(
-  [keyboard-backlight]="f313a81e47401f0d38b8602e5997f52c5286d5e97f74027564ddd515b3d16511 79215eed4da8036e25cd70ad09276823aad92d386a68c69d589d587c93b79c60 21bceaa64e355808ca6c21011564c08a20e305bb7e30939d113fa43347de2b3b"
+  [keyboard-backlight]="f313a81e47401f0d38b8602e5997f52c5286d5e97f74027564ddd515b3d16511 79215eed4da8036e25cd70ad09276823aad92d386a68c69d589d587c93b79c60"
   [force-igpu]="de620729f0c824225487ab988a53158de7336e4151d594c49641a99ed5740e6b d604e7c4903829563e45fc52188fc5602c3f1bc66e247f0a2cc0a974ed6e57db cbcd9972eb194369947bfcf630909a7c2f24170fb5526355c7d32122d3b1f3be cb619d71989c044e75c0c446af29fc6fb7853e47a29c41800e083c0218a71f3d"
 )
 
